@@ -67,6 +67,10 @@ MEMORY_FILE = os.path.join(SCRIPT_DIR, "nora2_chat_memory.json")
 PERSONALITY_FILE = os.path.join(SCRIPT_DIR, "personality.json")
 FAVORABILITY_FILE = os.path.join(SCRIPT_DIR, "nora2_favorability.json")
 EMOTION_FILE = os.path.join(SCRIPT_DIR, "nora2_emotion.json")
+LONG_TERM_MEMORY_FILE = os.path.join(SCRIPT_DIR, "long_term_memory.json")
+MEMORY_EXTRACTION_INTERVAL = 20
+MAX_LONG_TERM_MEMORIES = 100
+EXTRACTION_STATE_FILE = os.path.join(SCRIPT_DIR, "nora2_extraction_state.json")
 SENSEVOICE_MODEL = "iic/SenseVoiceSmall"
 SAMPLE_RATE = 16000
 
@@ -160,6 +164,199 @@ def save_emotion_state(state):
 
 
 # ============================================================
+# 长期记忆管理
+# ============================================================
+def _load_long_term_memory():
+    """加载长期记忆，不存在则返回空列表"""
+    if os.path.exists(LONG_TERM_MEMORY_FILE):
+        try:
+            with open(LONG_TERM_MEMORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def _save_long_term_memory(memories):
+    """保存长期记忆到文件（去重 + 排序 + 截断）"""
+    seen = set()
+    deduped = []
+    for item in memories:
+        content = item.get("content", "").strip()
+        if not content:
+            continue
+        key = content.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append({
+                "content": content,
+                "importance": int(item.get("importance", 5))
+            })
+    deduped.sort(key=lambda x: x.get("importance", 0), reverse=True)
+    if len(deduped) > MAX_LONG_TERM_MEMORIES:
+        deduped = deduped[:MAX_LONG_TERM_MEMORIES]
+    try:
+        with open(LONG_TERM_MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(deduped, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _format_long_term_memory():
+    """格式化长期记忆为注入文本，无记忆时返回空字符串"""
+    global long_term_memory
+    with _ltm_lock:
+        if not long_term_memory:
+            return ""
+        lines = ["【长期记忆】", ""]
+        for item in long_term_memory:
+            lines.append(f"- {item['content']}")
+        lines.append("")
+        lines.append("请记住这些信息，在对话中保持前后一致。")
+        return "\n".join(lines)
+
+
+def _merge_long_term_memories(existing, new_items):
+    """合并记忆列表，按内容去重"""
+    merged = list(existing)
+    existing_keys = {item["content"].strip().lower() for item in existing}
+    for item in new_items:
+        content = item.get("content", "").strip()
+        if not content:
+            continue
+        if content.lower() not in existing_keys:
+            existing_keys.add(content.lower())
+            merged.append({
+                "content": content,
+                "importance": int(item.get("importance", 5))
+            })
+    merged.sort(key=lambda x: x.get("importance", 0), reverse=True)
+    if len(merged) > MAX_LONG_TERM_MEMORIES:
+        merged = merged[:MAX_LONG_TERM_MEMORIES]
+    return merged
+
+
+def _load_extraction_state():
+    """加载提取状态，返回 (total_rounds, last_extraction_round)"""
+    if os.path.exists(EXTRACTION_STATE_FILE):
+        try:
+            with open(EXTRACTION_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return (
+                int(data.get("total_rounds", 0)),
+                int(data.get("last_extraction_round", 0))
+            )
+        except Exception:
+            pass
+    return (0, 0)
+
+
+def _save_extraction_state(total_rounds, last_extraction_round):
+    """保存提取状态（总轮数 + 上次提取轮次）"""
+    try:
+        with open(EXTRACTION_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "total_rounds": total_rounds,
+                "last_extraction_round": last_extraction_round
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _do_extract_long_term_memory(recent_messages):
+    """后台线程：调用 LLM 从最近聊天记录提取长期记忆"""
+    global long_term_memory
+
+    conv_lines = []
+    for msg in recent_messages:
+        role = "用户" if msg["role"] == "user" else "猫娘"
+        conv_lines.append(f"{role}：{msg['content']}")
+    conv_text = "\n".join(conv_lines)
+
+    extraction_prompt = f"""分析以下聊天记录，提取所有关于【用户】和【猫娘】的长期有效信息。
+
+逐条排查以下类别，列出所有有价值的信息：
+- 兴趣爱好（喜欢什么电影/音乐/食物/运动等）
+- 长期习惯（作息、工作方式、日常活动）
+- 项目计划（正在做的工作、学习目标、未来安排）
+- 身份背景（职业、技能、所学专业、所在城市）
+- 个人偏好（口味、风格、审美、喜欢/不喜欢什么）
+
+规则：
+- 用户和猫娘的信息都要提取，每条标明是谁（如"用户喜欢..."或"猫娘喜欢..."）
+- 只提取有实质信息的条目，跳过纯闲聊和情绪表达
+- 不要遗漏，有多少条就列多少条
+
+聊天记录：
+{conv_text}
+
+请用以下格式逐条列出（每条一行）：
+用户喜欢xxx | 重要性:7
+猫娘喜欢xxx | 重要性:6
+
+如果没有值得长期记忆的信息，回复"无"。"""
+
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": extraction_prompt}],
+        "stream": False,
+        "options": {
+            "num_predict": 2048,
+            "temperature": 0.3,
+        }
+    }
+
+    try:
+        resp = req.post(OLLAMA_API, json=body, timeout=120)
+        resp.raise_for_status()
+        result = resp.json()
+        raw_content = result.get("message", {}).get("content", "").strip()
+        if not raw_content or raw_content == "无":
+            print("[长期记忆提取] 没有值得长期记忆的信息")
+            return
+    except Exception as e:
+        print(f"[长期记忆提取] LLM 调用失败: {e}")
+        return
+
+    # 解析文本格式：内容 | 重要性:N
+    new_items = []
+    for line in raw_content.split("\n"):
+        line = line.strip()
+        if not line or line == "无":
+            continue
+        # 匹配 "xxx | 重要性:N" 格式
+        match = re.match(r'(.+?)\s*\|\s*重要性\s*[:：]\s*(\d+)', line)
+        if match:
+            content = match.group(1).strip()
+            importance = int(match.group(2))
+            if content:
+                new_items.append({"content": content, "importance": importance})
+        else:
+            # 尝试作为 JSON 解析（兼容旧格式）
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict) and "content" in item:
+                    new_items.append(item)
+                elif isinstance(item, list):
+                    new_items.extend(item)
+            except json.JSONDecodeError:
+                pass
+
+    if not new_items:
+        print(f"[长期记忆提取] 未解析到有效条目，原始返回: {raw_content[:200]}")
+        return
+
+    with _ltm_lock:
+        merged = _merge_long_term_memories(long_term_memory, new_items)
+        long_term_memory[:] = merged
+        _save_long_term_memory(long_term_memory)
+
+    print(f"[长期记忆提取] 本次提取 {len(new_items)} 条，合并后共 {len(long_term_memory)} 条长期记忆")
+
+
+# ============================================================
 # 初始化 STT（SenseVoice，FunASR 中文识别 SOTA）
 # ============================================================
 print("加载语音识别模型 (SenseVoiceSmall)...")
@@ -211,6 +408,8 @@ def build_system_prompt(config, favorability, emotion):
     }
     emotion_text = emotion_cn.get(emotion, "平静")
 
+    ltm_lines = _format_long_term_memory()
+
     prompt = f"""你是{name}，一只温柔可爱的猫娘。
 
 性格特点：
@@ -221,7 +420,7 @@ def build_system_prompt(config, favorability, emotion):
 【当前状态 - 必须严格遵守】
 - 好感度：{favorability}/100
 - 当前情绪：{emotion_text}
-
+{ltm_lines}
 【回复格式要求 - 极其重要】
 你必须严格使用以下 JSON 格式回复，不要输出任何其他内容：
 {{"emotion":"<{', '.join(sorted(VALID_EMOTIONS))}>","favorability_change":<整数>,"reply":"<你的对话内容>"}}
@@ -269,6 +468,10 @@ favorability = load_favorability()
 emotion_state = load_emotion_state()
 current_emotion = emotion_state["emotion"]
 
+# 加载长期记忆
+long_term_memory = _load_long_term_memory()
+_ltm_lock = threading.Lock()
+
 SYSTEM_PROMPT = build_system_prompt(personality_config, favorability, current_emotion)
 print(f"已加载人格：{personality_config['name']}")
 print(f"初始好感度：{favorability}")
@@ -292,6 +495,11 @@ if os.path.exists(MEMORY_FILE):
         memory = json.load(f)
 else:
     memory = []
+
+# 初始化总对话轮数（持久化计数器，不受 memory 裁剪影响）
+_total_rounds, _last_extraction = _load_extraction_state()
+if _total_rounds == 0:
+    _total_rounds = len(memory) // 2
 
 
 # ============================================================
@@ -854,6 +1062,23 @@ class VoiceChatWorker(QThread):
             except Exception:
                 pass
 
+            # ---- 长期记忆提取检查 ----
+            if not is_active_chat:
+                global _total_rounds, _last_extraction
+                _total_rounds += 1
+                _save_extraction_state(_total_rounds, _last_extraction)
+                if (_total_rounds > 0 and
+                    _total_rounds % MEMORY_EXTRACTION_INTERVAL == 0 and
+                    _total_rounds > _last_extraction):
+                    _last_extraction = _total_rounds
+                    _save_extraction_state(_total_rounds, _last_extraction)
+                    recent = list(memory[-(MEMORY_EXTRACTION_INTERVAL * 2):])
+                    threading.Thread(
+                        target=_do_extract_long_term_memory,
+                        args=(recent,),
+                        daemon=True
+                    ).start()
+
             return parsed
 
         except Exception as e:
@@ -874,12 +1099,14 @@ class VoiceChatWorker(QThread):
             "sad": "伤心", "shy": "害羞",
         }
 
+        ltm_section = _format_long_term_memory()
+
         prompt = f"""当前好感度：{favorability}/100
 当前情绪：{emotion_cn.get(current_emotion, '平静')}
 
 用户已经有一段时间没有和你说话了。
 
-你是温柔猫娘。请主动发起一句聊天，不要太长，自然一点，用可爱的语气。
+{ltm_section}你是温柔猫娘。请主动发起一句聊天，不要太长，自然一点，用可爱的语气。
 
 必须使用JSON格式回复：
 {{"emotion":"<你的情绪>","favorability_change":0,"reply":"<你的主动搭话>"}}"""
@@ -1329,6 +1556,8 @@ class CatGirlWindow(QMainWindow):
         self.worker.wait(3000)
         _tts_queue.put(None)
         # 保存最终状态
+        global _total_rounds, _last_extraction
+        _save_extraction_state(_total_rounds, _last_extraction)
         save_favorability(favorability)
         save_emotion_state({
             "emotion": current_emotion,

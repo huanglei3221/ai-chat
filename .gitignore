@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Runtime logs
+logs/
+
 # IDE
 .vscode/
 .idea/

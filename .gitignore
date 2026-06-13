@@ -9,6 +9,12 @@ __pycache__/
 # Runtime logs
 logs/
 
+# Runtime generated state
+**/chat_memory.json
+**/*_memory.json
+**/emotion.json
+**/favorability.json
+
 # IDE
 .vscode/
 .idea/
